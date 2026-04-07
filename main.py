@@ -1,73 +1,79 @@
 import pandas as pd
+import re
 import os
-import google.generativeai as genai
 from supabase import create_client
+from datetime import datetime, timedelta
 
-# 1. Setup Connections (Render Environment Variables)
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+# Initialize Supabase from Environment Variables (Safe for work laptops)
+url = os.environ.get("SUPABASE_URL")
+key = os.environ.get("SUPABASE_KEY")
+supabase = create_client(url, key)
 
-# Professional Analyst Configuration for 2026 Stable Tier 1
-model = genai.GenerativeModel(
-    model_name='gemini-2.5-flash',
-    system_instruction="You are a professional real estate data analyst. Use clinical, professional language. Do not use informal or personified terms like 'hot' to describe people. Instead, use 'High Priority' or 'Immediate Follow-up'."
-)
+def download_from_cloud(firm_name):
+    """Downloads the CSV from Supabase Storage to Render's temporary memory."""
+    file_name = f"{firm_name.replace(' ', '_')}_leads.csv"
+    try:
+        with open(file_name, 'wb+') as f:
+            # Reaches into the private 'client-uploads' bucket
+            res = supabase.storage.from_('client-uploads').download(file_name)
+            f.write(res)
+        return file_name
+    except Exception as e:
+        print(f"Cloud Storage Error for {firm_name}: {e}")
+        return None
 
-supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+def clean_context(text):
+    """Strips HTML to find 'Website Identification' and other gold."""
+    if pd.isna(text) or not isinstance(text, str): return ""
+    return re.sub(r'<.*?>', ' ', text).strip()
 
-def process_daily_leads(csv_file):
-    print(f"--- Starting Daily Lead Process for {csv_file} ---")
+def score_lead(row):
+    """Applies the 8-Segment Weighted Logic."""
+    score = 0
+    notes = str(row.get('clean_context', '')).lower()
+    # Segment 7: Recent Activity
+    if "website identification" in notes or "fello click" in notes:
+        score += 15
+    # Segment 1: Long-term ownership (Proxy check)
+    if "15 year" in str(row.get('Tags', '')).lower():
+        score += 10
+    # Segment 5: Warm/Hot
+    if "hot" in str(row.get('Stage', '')).lower():
+        score += 8
+    return score
+
+def start_audit_cycle():
+    # 1. Check who is due in the 'client_jobs' table
+    jobs = supabase.table("client_jobs").select("*, clients(*)").lte("next_run_due", datetime.now().isoformat()).execute()
     
-    # Load the data
-    df = pd.read_csv(csv_file)
-    
-    # Filter for High Priority leads and sort by most recent
-    df['Last Contact Date'] = pd.to_datetime(df['Last Contact Date'])
-    high_priority = df[df['Priority Score'] == 'High'].sort_values(by='Last Contact Date', ascending=False)
+    if not jobs.data:
+        print("No audits due today. System idling.")
+        return
 
-    # Pick the top 10 leads to evaluate
-    top_leads = high_priority.head(10)
-    
-    print(f"Found {len(top_leads)} high-priority leads to check.")
-    
-    for _, lead in top_leads.iterrows():
-        # LOGGING: See exactly who is being checked
-        print(f"Checking lead: {lead['Name']} ({lead['Email']})...") 
+    for job in jobs.data:
+        firm = job['clients']
+        print(f"Beginning Audit for {firm['firm_name']}...")
+        
+        # 2. Grab the file from the cloud
+        file_path = download_from_cloud(firm['firm_name'])
+        
+        if file_path:
+            df = pd.read_csv(file_path, low_memory=False)
+            df['clean_context'] = df['Notes'].apply(clean_context) # Adjust 'Notes' to your CRM col name
+            df['score'] = df.apply(score_lead, axis=1)
+            
+            # 3. Filter top leads (respecting the daily_lead_limit)
+            top_leads = df.sort_values(by='score', ascending=False).head(firm['daily_lead_limit'])
+            
+            for _, lead in top_leads.iterrows():
+                # Notify & Log
+                print(f"Lead Found: {lead['Name']} (Score: {lead['score']})")
+                # (Insert your SMS/Email notification trigger here)
 
-        # Check Supabase: Skip if this specific email was already handled
-        res = supabase.table("processed_leads").select("*").eq("lead_email", lead['Email']).execute()
-        
-        if len(res.data) > 0:
-            print(f"   >>> Skipping {lead['Name']} - already in database.")
-            continue  
-
-        # Professional Data-Driven Prompt
-        prompt = f"""
-        Analyze the following real estate lead and provide a data-driven 3-step action plan.
-        
-        Name: {lead['Name']}
-        Status: {lead['Reason']}
-        Last Contact: {lead['Last Contact Date']}
-        Suggested Opening: {lead['Suggested Opening']}
-        
-        Output a concise 'One Big Thing' action plan for an agent.
-        """
-        
-        print(f"   >>> Generating action plan for {lead['Name']}...")
-        response = model.generate_content(prompt)
-        
-        print(f"--- ACTION PLAN FOR {lead['Name']} ---")
-        print(response.text)
-        
-        # Save to Supabase Memory
-        supabase.table("processed_leads").insert({
-            "lead_email": lead['Email'],
-            "summary": response.text
-        }).execute()
-        
-        print(f"   >>> {lead['Name']} saved to Supabase.")
-
-    print("--- Process Complete ---")
+            # 4. Cleanup & Re-schedule
+            os.remove(file_path) # Delete temp file from Render
+            next_run = (datetime.now() + timedelta(days=30)).isoformat()
+            supabase.table("client_jobs").update({"next_run_due": next_run}).eq("id", job['id']).execute()
 
 if __name__ == "__main__":
-    # Ensure the filename matches your uploaded file exactly
-    process_daily_leads('Scout_Master_Leads (1).csv')
+    start_audit_cycle()
